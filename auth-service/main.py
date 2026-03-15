@@ -19,6 +19,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 import httpx
 from urllib.parse import urlencode
+import base64
 
 # Load environment variables
 load_dotenv()
@@ -412,7 +413,7 @@ async def github_login():
     params = {
         "client_id": GITHUB_CLIENT_ID,
         "redirect_uri": GITHUB_REDIRECT_URI,
-        "scope": "user:email repo",  # Added 'repo' scope for private repos
+        "scope": "user:email repo",
         "state": secrets.token_urlsafe(16)
     }
     
@@ -432,7 +433,6 @@ async def github_callback(code: str, state: str = None):
         }
         
         async with httpx.AsyncClient() as client:
-            # Get access token
             token_response = await client.post(
                 token_url,
                 params=token_params,
@@ -446,14 +446,12 @@ async def github_callback(code: str, state: str = None):
             
             access_token = token_data.get("access_token")
             
-            # Get user info from GitHub
             user_response = await client.get(
                 "https://api.github.com/user",
                 headers={"Authorization": f"Bearer {access_token}"}
             )
             github_user = user_response.json()
             
-            # Get user emails
             emails_response = await client.get(
                 "https://api.github.com/user/emails",
                 headers={"Authorization": f"Bearer {access_token}"}
@@ -471,15 +469,10 @@ async def github_callback(code: str, state: str = None):
             
             github_user["email"] = primary_email
         
-        # Create or update user in database with access token
         user_id = await create_github_user(github_user, access_token)
-        
-        # Create JWT token
         jwt_token = create_access_token(data={"sub": str(user_id)})
         
-        # Redirect to frontend
         frontend_url = f"{FRONTEND_URL}/auth/github-callback?token={jwt_token}"
-        
         return RedirectResponse(url=frontend_url)
         
     except Exception as e:
@@ -491,7 +484,6 @@ async def github_callback(code: str, state: str = None):
 async def github_token_exchange(token: str):
     """Exchange GitHub token for user info"""
     try:
-        # Decode token to get user_id
         try:
             payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
             user_id = payload.get("sub")
@@ -506,7 +498,6 @@ async def github_token_exchange(token: str):
                 content={"success": False, "message": "Invalid token"}
             )
         
-        # Get user from database
         user = await find_user_by_id(int(user_id))
         if not user:
             return JSONResponse(
@@ -514,9 +505,7 @@ async def github_token_exchange(token: str):
                 content={"success": False, "message": "User not found"}
             )
         
-        # Convert to dict
         user_dict = dict(user)
-        
         return {
             "success": True,
             "user": {
@@ -547,7 +536,6 @@ async def get_github_repositories(current_user = Depends(get_current_user)):
                 content={"success": False, "message": "Not authenticated"}
             )
         
-        # Get user's GitHub access token from database
         query = "SELECT github_access_token, github_id FROM users WHERE id = :id"
         user_token = await database.fetch_one(query=query, values={"id": current_user['id']})
         
@@ -557,7 +545,6 @@ async def get_github_repositories(current_user = Depends(get_current_user)):
                 content={"success": False, "message": "No GitHub account connected"}
             )
         
-        # Fetch repositories from GitHub API
         async with httpx.AsyncClient() as client:
             repos_response = await client.get(
                 "https://api.github.com/user/repos?sort=updated&per_page=100",
@@ -575,8 +562,6 @@ async def get_github_repositories(current_user = Depends(get_current_user)):
                 )
             
             repos_data = repos_response.json()
-            
-            # Format repositories
             repositories = []
             for repo in repos_data:
                 repositories.append({
@@ -591,7 +576,6 @@ async def get_github_repositories(current_user = Depends(get_current_user)):
                     "private": repo["private"],
                     "updated_at": repo["updated_at"]
                 })
-            
             return repositories
             
     except Exception as e:
@@ -612,7 +596,6 @@ async def get_github_repository(owner: str, repo: str, current_user = Depends(ge
                 content={"success": False, "message": "Not authenticated"}
             )
         
-        # Get user's GitHub access token from database
         query = "SELECT github_access_token FROM users WHERE id = :id"
         user_token = await database.fetch_one(query=query, values={"id": current_user['id']})
         
@@ -622,7 +605,6 @@ async def get_github_repository(owner: str, repo: str, current_user = Depends(ge
                 content={"success": False, "message": "No GitHub account connected"}
             )
         
-        # Fetch repository from GitHub API
         async with httpx.AsyncClient() as client:
             repo_response = await client.get(
                 f"https://api.github.com/repos/{owner}/{repo}",
@@ -639,14 +621,12 @@ async def get_github_repository(owner: str, repo: str, current_user = Depends(ge
                     error_msg = error_data.get('message', error_msg)
                 except:
                     pass
-                    
                 return JSONResponse(
                     status_code=repo_response.status_code,
                     content={"success": False, "message": error_msg}
                 )
             
             repo_data = repo_response.json()
-            
             return {
                 "id": repo_data["id"],
                 "name": repo_data["name"],
@@ -662,6 +642,130 @@ async def get_github_repository(owner: str, repo: str, current_user = Depends(ge
             
     except Exception as e:
         logger.error(f"❌ Error fetching repository: {str(e)}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": str(e)}
+        )
+
+@app.get("/github/repo/{owner}/{repo}/contents/{path:path}")
+async def get_repo_contents(owner: str, repo: str, path: str = "", current_user = Depends(get_current_user)):
+    """Get contents of a repository path"""
+    try:
+        if not current_user:
+            return JSONResponse(status_code=401, content={"success": False, "message": "Not authenticated"})
+        
+        query = "SELECT github_access_token FROM users WHERE id = :id"
+        user_token = await database.fetch_one(query=query, values={"id": current_user['id']})
+        
+        if not user_token or not user_token['github_access_token']:
+            return JSONResponse(status_code=400, content={"success": False, "message": "No GitHub account connected"})
+        
+        async with httpx.AsyncClient() as client:
+            contents_response = await client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+                headers={
+                    "Authorization": f"Bearer {user_token['github_access_token']}",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+            )
+            
+            if contents_response.status_code != 200:
+                return JSONResponse(
+                    status_code=contents_response.status_code,
+                    content={"success": False, "message": "Failed to fetch contents"}
+                )
+            
+            contents = contents_response.json()
+            formatted_contents = []
+            for item in contents:
+                formatted_contents.append({
+                    "name": item["name"],
+                    "path": item["path"],
+                    "type": item["type"],
+                    "size": item.get("size", 0),
+                    "download_url": item.get("download_url"),
+                    "html_url": item["html_url"]
+                })
+            return formatted_contents
+            
+    except Exception as e:
+        logger.error(f"❌ Error fetching contents: {str(e)}")
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+# ========== NEW FILE CONTENT ENDPOINT ==========
+
+@app.get("/github/repo/{owner}/{repo}/file/{path:path}")
+async def get_file_content(owner: str, repo: str, path: str, current_user = Depends(get_current_user)):
+    """Get content of a specific file from GitHub"""
+    try:
+        if not current_user:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"success": False, "message": "Not authenticated"}
+            )
+        
+        query = "SELECT github_access_token FROM users WHERE id = :id"
+        user_token = await database.fetch_one(query=query, values={"id": current_user['id']})
+        
+        if not user_token or not user_token['github_access_token']:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "No GitHub account connected"}
+            )
+        
+        async with httpx.AsyncClient() as github_client:
+            file_response = await github_client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+                headers={
+                    "Authorization": f"Bearer {user_token['github_access_token']}",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+            )
+            
+            if file_response.status_code != 200:
+                return JSONResponse(
+                    status_code=file_response.status_code,
+                    content={"success": False, "message": "File not found"}
+                )
+            
+            file_data = file_response.json()
+            
+            if file_data.get('type') == 'file' and file_data.get('download_url'):
+                content_response = await github_client.get(file_data['download_url'])
+                content_type = content_response.headers.get('content-type', '')
+                
+                if 'text' in content_type or 'json' in content_type or 'javascript' in content_type or 'markdown' in content_type:
+                    return {
+                        "success": True,
+                        "type": "text",
+                        "name": file_data['name'],
+                        "path": file_data['path'],
+                        "content": content_response.text,
+                        "size": file_data['size'],
+                        "encoding": "utf-8",
+                        "html_url": file_data['html_url']
+                    }
+                else:
+                    content_base64 = base64.b64encode(content_response.content).decode('utf-8')
+                    return {
+                        "success": True,
+                        "type": "binary",
+                        "name": file_data['name'],
+                        "path": file_data['path'],
+                        "content": content_base64,
+                        "size": file_data['size'],
+                        "encoding": "base64",
+                        "html_url": file_data['html_url']
+                    }
+            
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"success": False, "message": "Not a file"}
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ Error fetching file content: {str(e)}")
         traceback.print_exc()
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -869,55 +973,7 @@ async def get_all_users():
             "success": False,
             "message": str(e)
         }
-@app.get("/github/repo/{owner}/{repo}/contents/{path:path}")
-async def get_repo_contents(owner: str, repo: str, path: str = "", current_user = Depends(get_current_user)):
-    """Get contents of a repository path"""
-    try:
-        if not current_user:
-            return JSONResponse(status_code=401, content={"success": False, "message": "Not authenticated"})
-        
-        # Get user's GitHub access token
-        query = "SELECT github_access_token FROM users WHERE id = :id"
-        user_token = await database.fetch_one(query=query, values={"id": current_user['id']})
-        
-        if not user_token or not user_token['github_access_token']:
-            return JSONResponse(status_code=400, content={"success": False, "message": "No GitHub account connected"})
-        
-        # Fetch contents from GitHub API
-        async with httpx.AsyncClient() as client:
-            contents_response = await client.get(
-                f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
-                headers={
-                    "Authorization": f"Bearer {user_token['github_access_token']}",
-                    "Accept": "application/vnd.github.v3+json"
-                }
-            )
-            
-            if contents_response.status_code != 200:
-                return JSONResponse(
-                    status_code=contents_response.status_code,
-                    content={"success": False, "message": "Failed to fetch contents"}
-                )
-            
-            contents = contents_response.json()
-            
-            # Format the response
-            formatted_contents = []
-            for item in contents:
-                formatted_contents.append({
-                    "name": item["name"],
-                    "path": item["path"],
-                    "type": item["type"],  # "file" or "dir"
-                    "size": item.get("size", 0),
-                    "download_url": item.get("download_url"),
-                    "html_url": item["html_url"]
-                })
-            
-            return formatted_contents
-            
-    except Exception as e:
-        logger.error(f"❌ Error fetching contents: {str(e)}")
-        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
 @app.get("/debug/routes")
 async def debug_routes():
     """List all routes"""
@@ -983,7 +1039,9 @@ async def api_status():
             },
             "github": {
                 "repositories": "/github/repositories",
-                "repo": "/github/repo/{owner}/{repo}"
+                "repo": "/github/repo/{owner}/{repo}",
+                "contents": "/github/repo/{owner}/{repo}/contents/{path}",
+                "file": "/github/repo/{owner}/{repo}/file/{path}"
             },
             "users": {
                 "all": "/auth/users"
@@ -991,7 +1049,6 @@ async def api_status():
             "debug": "/debug/routes"
         }
     }
-    
 
 # ========== MAIN ==========
 if __name__ == "__main__":
