@@ -1,8 +1,9 @@
 import os
 import uvicorn
-from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, status, Depends, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
 from dotenv import load_dotenv
 import datetime
 from pydantic import BaseModel, EmailStr, field_validator
@@ -11,10 +12,13 @@ import secrets
 import asyncpg
 from databases import Database
 import logging
-from passlib.context import CryptContext
 from contextlib import asynccontextmanager
 import hashlib
 import traceback
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+import httpx
+from urllib.parse import urlencode
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +30,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ========== JWT CONFIG ==========
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
+
+# ========== GITHUB OAUTH CONFIG ==========
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+GITHUB_REDIRECT_URI = os.getenv("GITHUB_REDIRECT_URI")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
+
 # ========== DATABASE CONFIG ==========
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -34,37 +49,59 @@ if not DATABASE_URL:
 
 database = Database(DATABASE_URL)
 
-# ========== PASSWORD HASHING WITH FALLBACK ==========
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto",
-    bcrypt__rounds=12
-)
+# ========== PASSWORD HASHING ==========
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def hash_password(password: str) -> str:
-    """Hash password with automatic truncation if needed"""
-    try:
-        logger.info(f"Hashing password of length: {len(password)}")
-        return pwd_context.hash(password)
-    except Exception as e:
-        logger.warning(f"⚠️ Password hashing issue: {str(e)[:50]}, using fallback method")
-        temp_hash = hashlib.sha256(password.encode()).hexdigest()
-        return pwd_context.hash(temp_hash)
+    """Hash password using bcrypt"""
+    return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password with fallback support"""
+    """Verify password against hash"""
     try:
-        if pwd_context.verify(plain_password, hashed_password):
-            return True
+        from passlib.hash import bcrypt
+        return bcrypt.verify(plain_password, hashed_password)
     except Exception as e:
-        logger.warning(f"⚠️ Normal verification failed: {str(e)[:50]}, trying fallback")
-    
-    try:
-        temp_hash = hashlib.sha256(plain_password.encode()).hexdigest()
-        return pwd_context.verify(temp_hash, hashed_password)
-    except Exception as e:
-        logger.error(f"❌ Both verification methods failed: {str(e)}")
+        logger.error(f"❌ Password verification error: {str(e)}")
         return False
+
+# ========== JWT FUNCTIONS ==========
+def create_access_token(data: dict, expires_delta: Optional[datetime.timedelta] = None):
+    """Create JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.datetime.now(datetime.timezone.utc) + expires_delta
+    else:
+        expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    """Get current user from JWT token"""
+    if not token:
+        return None
+    
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    user = await find_user_by_id(int(user_id))
+    if user is None:
+        raise credentials_exception
+    return user
 
 # ========== DATABASE LIFESPAN ==========
 @asynccontextmanager
@@ -78,8 +115,8 @@ async def lifespan(app: FastAPI):
         # Create tables
         await create_tables()
         
-        # Create test user
-        await create_test_user()
+        # Create test users
+        await create_test_users()
         
         print("\n" + "="*80)
         print("🚀 AUTH SERVICE STARTED SUCCESSFULLY!")
@@ -87,9 +124,11 @@ async def lifespan(app: FastAPI):
         print(f"📡 Server: http://localhost:{os.getenv('PORT', 8000)}")
         print(f"📝 API Docs: http://localhost:{os.getenv('PORT', 8000)}/docs")
         print(f"🗄️  Database: PostgreSQL on Neon")
-        print("\n✅ Test User Credentials:")
-        print("   └─ 📧 Email: test@example.com")
-        print("   └─ 🔑 Password: Test@123")
+        print("\n✅ Test Users:")
+        print("   └─ 📧 test@example.com / Test@123")
+        print("   └─ 📧 john@example.com / Test@123")
+        print("\n🔐 GitHub OAuth Ready!")
+        print("   └─ Client ID:", GITHUB_CLIENT_ID[:10] + "..." if GITHUB_CLIENT_ID else "Not Set")
         print("="*80 + "\n")
     except Exception as e:
         logger.error(f"❌ Startup error: {str(e)}")
@@ -108,7 +147,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Auth Service",
     version="1.0.0",
-    description="Authentication microservice with PostgreSQL",
+    description="Authentication microservice with GitHub OAuth",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan
@@ -120,7 +159,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:4200",
         "http://127.0.0.1:4200",
-        "*"
+        FRONTEND_URL
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -155,6 +194,8 @@ class UserResponse(BaseModel):
     name: str
     email: str
     created_at: str
+    github_id: Optional[str] = None
+    avatar_url: Optional[str] = None
 
 class AuthResponse(BaseModel):
     success: bool
@@ -172,23 +213,14 @@ async def create_tables():
             id SERIAL PRIMARY KEY,
             name VARCHAR(100) NOT NULL,
             email VARCHAR(255) UNIQUE NOT NULL,
-            password VARCHAR(255) NOT NULL,
+            password VARCHAR(255),
+            github_id VARCHAR(100) UNIQUE,
+            avatar_url TEXT,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
         """
         
-        create_tokens_table = """
-        CREATE TABLE IF NOT EXISTS tokens (
-            id SERIAL PRIMARY KEY,
-            token VARCHAR(255) UNIQUE NOT NULL,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP + INTERVAL '7 days'
-        );
-        """
-        
         await database.execute(query=create_users_table)
-        await database.execute(query=create_tokens_table)
         logger.info("✅ Database tables created/verified")
         
     except Exception as e:
@@ -196,8 +228,8 @@ async def create_tables():
         traceback.print_exc()
         raise
 
-async def create_test_user():
-    """Create test user if not exists"""
+async def create_test_users():
+    """Create test users if not exists"""
     try:
         check_query = "SELECT id FROM users WHERE email = 'test@example.com'"
         existing = await database.fetch_one(query=check_query)
@@ -217,59 +249,237 @@ async def create_test_user():
                     "created_at": datetime.datetime.now()
                 }
             )
-            logger.info("✅ Test user created successfully")
+            
+            await database.execute(
+                query=insert_query,
+                values={
+                    "name": "John Doe",
+                    "email": "john@example.com",
+                    "password": hashed,
+                    "created_at": datetime.datetime.now()
+                }
+            )
+            logger.info("✅ Test users created")
         else:
-            logger.info("✅ Test user already exists")
+            logger.info("✅ Test users already exist")
+            
     except Exception as e:
-        logger.error(f"❌ Error creating test user: {str(e)}")
+        logger.error(f"❌ Error creating test users: {str(e)}")
         traceback.print_exc()
 
 async def find_user_by_email(email: str):
     """Find user by email"""
-    query = "SELECT id, name, email, password, created_at FROM users WHERE email = :email"
+    query = "SELECT id, name, email, password, created_at, github_id, avatar_url FROM users WHERE email = :email"
     return await database.fetch_one(query=query, values={"email": email})
 
-def generate_token():
-    """Generate random token"""
-    return secrets.token_urlsafe(32)
+async def find_user_by_github_id(github_id: str):
+    """Find user by GitHub ID"""
+    query = "SELECT id, name, email, created_at, github_id, avatar_url FROM users WHERE github_id = :github_id"
+    return await database.fetch_one(query=query, values={"github_id": github_id})
 
-# ========== API ENDPOINTS ==========
+async def find_user_by_id(user_id: int):
+    """Find user by ID"""
+    query = "SELECT id, name, email, created_at, github_id, avatar_url FROM users WHERE id = :id"
+    return await database.fetch_one(query=query, values={"id": user_id})
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "service": "auth-service",
-        "status": "running",
-        "version": "1.0.0",
-        "database": "PostgreSQL on Neon"
-    }
-
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
+async def create_github_user(github_data: dict):
+    """Create or update user from GitHub data"""
     try:
-        await database.execute("SELECT 1")
-        db_status = "connected"
+        existing = await find_user_by_github_id(str(github_data['id']))
+        
+        if existing:
+            update_query = """
+            UPDATE users 
+            SET name = :name, email = :email, avatar_url = :avatar_url
+            WHERE github_id = :github_id
+            RETURNING id
+            """
+            user_id = await database.execute(
+                query=update_query,
+                values={
+                    "name": github_data['name'] or github_data['login'],
+                    "email": github_data['email'] or f"{github_data['login']}@github.user",
+                    "avatar_url": github_data['avatar_url'],
+                    "github_id": str(github_data['id'])
+                }
+            )
+        else:
+            if github_data.get('email'):
+                email_user = await find_user_by_email(github_data['email'])
+                if email_user:
+                    update_query = """
+                    UPDATE users 
+                    SET github_id = :github_id, avatar_url = :avatar_url
+                    WHERE id = :id
+                    RETURNING id
+                    """
+                    user_id = await database.execute(
+                        query=update_query,
+                        values={
+                            "github_id": str(github_data['id']),
+                            "avatar_url": github_data['avatar_url'],
+                            "id": email_user['id']
+                        }
+                    )
+                    return user_id
+            
+            insert_query = """
+            INSERT INTO users (name, email, password, github_id, avatar_url, created_at)
+            VALUES (:name, :email, :password, :github_id, :avatar_url, :created_at)
+            RETURNING id
+            """
+            user_id = await database.execute(
+                query=insert_query,
+                values={
+                    "name": github_data['name'] or github_data['login'],
+                    "email": github_data['email'] or f"{github_data['login']}@github.user",
+                    "password": None,
+                    "github_id": str(github_data['id']),
+                    "avatar_url": github_data['avatar_url'],
+                    "created_at": datetime.datetime.now()
+                }
+            )
+        
+        return user_id
     except Exception as e:
-        db_status = f"disconnected: {str(e)}"
-    
-    return {
-        "status": "healthy",
-        "service": "auth-service",
-        "database": db_status,
-        "timestamp": datetime.datetime.now().isoformat()
-    }
+        logger.error(f"❌ Error creating GitHub user: {str(e)}")
+        traceback.print_exc()
+        raise
 
-@app.get("/info")
-async def info():
-    """Service information"""
-    return {
-        "service": app.title,
-        "version": app.version,
-        "environment": os.getenv("ENVIRONMENT", "development"),
-        "port": int(os.getenv("PORT", 8000))
+# ========== GITHUB OAUTH ENDPOINTS ==========
+
+@app.get("/auth/github/login")
+async def github_login():
+    """Redirect to GitHub OAuth login"""
+    if not GITHUB_CLIENT_ID:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "message": "GitHub OAuth not configured"}
+        )
+    
+    params = {
+        "client_id": GITHUB_CLIENT_ID,
+        "redirect_uri": GITHUB_REDIRECT_URI,
+        "scope": "user:email",
+        "state": secrets.token_urlsafe(16)
     }
+    
+    github_auth_url = f"https://github.com/login/oauth/authorize?{urlencode(params)}"
+    return RedirectResponse(url=github_auth_url)
+
+@app.get("/auth/github/callback")
+async def github_callback(code: str, state: str = None):
+    """GitHub OAuth callback"""
+    try:
+        token_url = "https://github.com/login/oauth/access_token"
+        token_params = {
+            "client_id": GITHUB_CLIENT_ID,
+            "client_secret": GITHUB_CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": GITHUB_REDIRECT_URI
+        }
+        
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(
+                token_url,
+                params=token_params,
+                headers={"Accept": "application/json"}
+            )
+            token_data = token_response.json()
+            
+            if "error" in token_data:
+                logger.error(f"GitHub token error: {token_data}")
+                return RedirectResponse(url=f"{FRONTEND_URL}/auth/login?error=github_auth_failed")
+            
+            access_token = token_data.get("access_token")
+            
+            user_response = await client.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            github_user = user_response.json()
+            
+            emails_response = await client.get(
+                "https://api.github.com/user/emails",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            emails = emails_response.json()
+            
+            primary_email = None
+            for email in emails:
+                if email.get("primary") and email.get("verified"):
+                    primary_email = email.get("email")
+                    break
+            
+            if not primary_email:
+                primary_email = emails[0].get("email") if emails else None
+            
+            github_user["email"] = primary_email
+        
+        user_id = await create_github_user(github_user)
+        
+        # Create JWT token
+        token = create_access_token(data={"sub": str(user_id)})
+        
+        # ✅ FIXED: Redirect to github-callback
+        frontend_url = f"{FRONTEND_URL}/auth/github-callback?token={token}"
+        
+        return RedirectResponse(url=frontend_url)
+        
+    except Exception as e:
+        logger.error(f"❌ GitHub callback error: {str(e)}")
+        traceback.print_exc()
+        return RedirectResponse(url=f"{FRONTEND_URL}/auth/login?error=github_auth_failed")
+
+@app.get("/auth/github/token")
+async def github_token_exchange(token: str):
+    """Exchange GitHub token for user info"""
+    try:
+        # Decode token to get user_id
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("sub")
+            if not user_id:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"success": False, "message": "Invalid token"}
+                )
+        except JWTError:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"success": False, "message": "Invalid token"}
+            )
+        
+        # Get user from database
+        user = await find_user_by_id(int(user_id))
+        if not user:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"success": False, "message": "User not found"}
+            )
+        
+        # Convert to dict
+        user_dict = dict(user)
+        
+        return {
+            "success": True,
+            "user": {
+                "id": user_dict.get('id'),
+                "name": user_dict.get('name'),
+                "email": user_dict.get('email'),
+                "avatar_url": user_dict.get('avatar_url'),
+                "github_id": user_dict.get('github_id')
+            }
+        }
+    except Exception as e:
+        logger.error(f"❌ Token exchange error: {str(e)}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"success": False, "message": str(e)}
+        )
+
+# ========== EMAIL/PASSWORD ENDPOINTS ==========
 
 @app.post("/auth/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 async def register(user_data: UserRegister):
@@ -277,7 +487,6 @@ async def register(user_data: UserRegister):
     try:
         logger.info(f"📝 Registration attempt: {user_data.email}")
         
-        # Check if user exists
         existing = await find_user_by_email(user_data.email)
         if existing:
             return JSONResponse(
@@ -288,9 +497,7 @@ async def register(user_data: UserRegister):
                 }
             )
         
-        # Hash password and create user
         hashed = hash_password(user_data.password)
-        logger.info(f"Password hashed successfully for: {user_data.email}")
         
         insert_query = """
         INSERT INTO users (name, email, password, created_at)
@@ -307,23 +514,21 @@ async def register(user_data: UserRegister):
             }
         )
         
-        # Generate token
-        token = generate_token()
+        access_token = create_access_token(data={"sub": str(user_id)})
         
         logger.info(f"✅ User registered: {user_data.email} (ID: {user_id})")
-        
-        # FIXED: Convert datetime to string for JSON response
-        now_iso = datetime.datetime.now().isoformat()
         
         return {
             "success": True,
             "message": "Registration successful",
-            "token": token,
+            "token": access_token,
             "user": {
                 "id": user_id,
                 "name": user_data.name,
                 "email": user_data.email,
-                "created_at": now_iso  # ✅ String for JSON
+                "created_at": datetime.datetime.now().isoformat(),
+                "github_id": None,
+                "avatar_url": None
             }
         }
         
@@ -344,10 +549,9 @@ async def login(login_data: UserLogin):
     try:
         logger.info(f"🔑 Login attempt: {login_data.email}")
         
-        # Find user
-        user = await find_user_by_email(login_data.email)
+        user_record = await find_user_by_email(login_data.email)
         
-        if not user:
+        if not user_record:
             logger.warning(f"❌ User not found: {login_data.email}")
             return JSONResponse(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -357,7 +561,17 @@ async def login(login_data: UserLogin):
                 }
             )
         
-        # Verify password
+        user = dict(user_record)
+        
+        if not user.get('password'):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "success": False,
+                    "message": "This account uses GitHub login. Please login with GitHub."
+                }
+            )
+        
         if not verify_password(login_data.password, user['password']):
             logger.warning(f"❌ Invalid password for: {login_data.email}")
             return JSONResponse(
@@ -368,23 +582,25 @@ async def login(login_data: UserLogin):
                 }
             )
         
-        # Generate token
-        token = generate_token()
+        access_token = create_access_token(data={"sub": str(user['id'])})
         
         logger.info(f"✅ Login successful: {login_data.email}")
         
-        # FIXED: Convert datetime to string for JSON response
-        created_at_str = user['created_at'].isoformat() if user['created_at'] else None
+        created_at_str = None
+        if user.get('created_at'):
+            created_at_str = user['created_at'].isoformat() if hasattr(user['created_at'], 'isoformat') else str(user['created_at'])
         
         return {
             "success": True,
             "message": "Login successful",
-            "token": token,
+            "token": access_token,
             "user": {
-                "id": user['id'],
-                "name": user['name'],
-                "email": user['email'],
-                "created_at": created_at_str  # ✅ String for JSON
+                "id": user.get('id'),
+                "name": user.get('name'),
+                "email": user.get('email'),
+                "created_at": created_at_str,
+                "github_id": user.get('github_id'),
+                "avatar_url": user.get('avatar_url')
             }
         }
         
@@ -399,54 +615,58 @@ async def login(login_data: UserLogin):
             }
         )
 
-@app.post("/auth/logout")
-async def logout(token: str):
-    """Logout user by invalidating token"""
-    try:
-        return {"success": True, "message": "Logged out successfully"}
-    except Exception as e:
-        logger.error(f"❌ Logout error: {str(e)}")
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "success": False,
-                "message": str(e)
-            }
-        )
+# ========== PROTECTED ENDPOINTS ==========
 
-@app.get("/auth/verify")
-async def verify_token(token: str):
-    """Verify if token is valid"""
-    try:
-        return {
-            "success": True,
-            "valid": True,
-            "message": "Token verification endpoint"
+@app.get("/auth/me")
+async def get_current_user_info(current_user = Depends(get_current_user)):
+    """Get current user info"""
+    if not current_user:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"success": False, "message": "Not authenticated"}
+        )
+    
+    if hasattr(current_user, '_mapping'):
+        current_user = dict(current_user)
+    
+    return {
+        "success": True,
+        "user": {
+            "id": current_user.get('id'),
+            "name": current_user.get('name'),
+            "email": current_user.get('email'),
+            "avatar_url": current_user.get('avatar_url'),
+            "github_id": current_user.get('github_id'),
+            "created_at": current_user.get('created_at').isoformat() if current_user.get('created_at') else None
         }
-    except Exception as e:
-        logger.error(f"❌ Token verification error: {str(e)}")
-        return {
-            "success": False,
-            "valid": False,
-            "message": str(e)
-        }
+    }
+
+@app.post("/auth/logout")
+async def logout():
+    """Logout user"""
+    return {"success": True, "message": "Logged out successfully"}
 
 @app.get("/auth/users")
 async def get_all_users():
     """Get all users"""
     try:
-        query = "SELECT id, name, email, created_at FROM users ORDER BY id"
+        query = "SELECT id, name, email, created_at, github_id, avatar_url FROM users ORDER BY id"
         rows = await database.fetch_all(query=query)
         
         users = []
         for row in rows:
-            # FIXED: Convert datetime to string for JSON
-            created_at_str = row['created_at'].isoformat() if row['created_at'] else None
+            user_dict = dict(row)
+            created_at_str = None
+            if user_dict.get('created_at'):
+                created_at_str = user_dict['created_at'].isoformat() if hasattr(user_dict['created_at'], 'isoformat') else str(user_dict['created_at'])
+            
             users.append({
-                "id": row['id'],
-                "name": row['name'],
-                "email": row['email'],
-                "created_at": created_at_str  # ✅ String for JSON
+                "id": user_dict.get('id'),
+                "name": user_dict.get('name'),
+                "email": user_dict.get('email'),
+                "github_id": user_dict.get('github_id'),
+                "avatar_url": user_dict.get('avatar_url'),
+                "created_at": created_at_str
             })
         
         return {
@@ -456,37 +676,6 @@ async def get_all_users():
         }
     except Exception as e:
         logger.error(f"❌ Error fetching users: {str(e)}")
-        return {
-            "success": False,
-            "message": str(e)
-        }
-
-@app.get("/auth/users/{user_id}")
-async def get_user(user_id: int):
-    """Get user by ID"""
-    try:
-        query = "SELECT id, name, email, created_at FROM users WHERE id = :id"
-        user = await database.fetch_one(query=query, values={"id": user_id})
-        
-        if user:
-            # FIXED: Convert datetime to string for JSON
-            created_at_str = user['created_at'].isoformat() if user['created_at'] else None
-            return {
-                "success": True,
-                "user": {
-                    "id": user['id'],
-                    "name": user['name'],
-                    "email": user['email'],
-                    "created_at": created_at_str  # ✅ String for JSON
-                }
-            }
-        
-        return {
-            "success": False,
-            "message": "User not found"
-        }
-    except Exception as e:
-        logger.error(f"❌ Error fetching user {user_id}: {str(e)}")
         return {
             "success": False,
             "message": str(e)
@@ -503,6 +692,77 @@ async def debug_routes():
                 "methods": list(route.methods)
             })
     return {"total": len(routes), "routes": routes}
+
+# ========== BASIC ENDPOINTS ==========
+@app.get("/")
+async def root():
+    return {"service": "auth-service", "status": "running"}
+
+@app.get("/health")
+async def health():
+    try:
+        await database.execute("SELECT 1")
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"disconnected: {str(e)}"
+    
+    return {
+        "status": "healthy",
+        "service": "auth-service",
+        "database": db_status,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+
+@app.get("/info")
+async def info():
+    return {
+        "service": "Auth Service",
+        "version": "1.0.0",
+        "environment": os.getenv("ENVIRONMENT", "development")
+    }
+
+@app.get("/test")
+async def test():
+    return {"message": "Backend is working!"}
+
+@app.get("/api-status")
+async def api_status():
+    return {
+        "status": "running",
+        "endpoints": {
+            "root": "/",
+            "health": "/health",
+            "info": "/info",
+            "test": "/test",
+            "api-status": "/api-status",
+            "auth": {
+                "register": "/auth/register",
+                "login": "/auth/login",
+                "logout": "/auth/logout",
+                "me": "/auth/me",
+                "github_login": "/auth/github/login",
+                "github_callback": "/auth/github/callback",
+                "github_token": "/auth/github/token"
+            },
+            "users": {
+                "all": "/auth/users"
+            },
+            "debug": "/debug/routes"
+        }
+    }
+    # ========== CORS CONFIG ==========
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:4200",
+        "http://127.0.0.1:4200",
+        "http://192.168.1.42:4200",  # ✅ Friend ka IP add karo
+        FRONTEND_URL
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ========== MAIN ==========
 if __name__ == "__main__":
